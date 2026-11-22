@@ -526,7 +526,7 @@ def register(sub) -> None:
                    help="prompt grammar (default by kind: sung short, motion screenplay; docs/60-clips.md §4)")
     p.add_argument("--window", choices=["clean", "vocal", "mix"],
                    help="@Audio1: clean vocal (sung default), raw vocal stem, or the mix (motion default)")
-    p.add_argument("--provider", choices=["openrouter", "higgsfield"]); p.add_argument("--model")
+    p.add_argument("--provider", choices=["openrouter", "higgsfield", "localqueue"]); p.add_argument("--model")
     p.add_argument("--res", choices=["480p", "720p", "1080p"]); p.add_argument("--force", action="store_true")
     p.add_argument("--words", help="sung: quote only these words (her words only; the clean window holds just them)")
     p.set_defaults(func=cmd_clip_new)
@@ -539,7 +539,7 @@ def register(sub) -> None:
     p.add_argument("--duration", type=int); p.add_argument("--song-t0", type=float)
     p.add_argument("--t0", type=float); p.add_argument("--t1", type=float)
     p.add_argument("--res", choices=["480p", "720p", "1080p"]); p.add_argument("--model")
-    p.add_argument("--provider", choices=["openrouter", "higgsfield"]); p.add_argument("--frame", choices=["ref", "first"])
+    p.add_argument("--provider", choices=["openrouter", "higgsfield", "localqueue"]); p.add_argument("--frame", choices=["ref", "first"])
     p.add_argument("--start"); p.add_argument("--ref", action="append", default=[]); p.add_argument("--clear-refs", action="store_true")
     p.add_argument("--audio", help="use this file as the window audio (e.g. the clean vocal window)")
     p.add_argument("--audio-mode", choices=["clean", "vocal", "mix"]); p.add_argument("--recut", action="store_true")
@@ -551,7 +551,7 @@ def register(sub) -> None:
     p.add_argument("clip"); p.set_defaults(func=cmd_clip_lock)
 
     p = cs.add_parser("submit", help="spend: OpenRouter job, or the Higgsfield request file for the bot (locked + --yes)")
-    p.add_argument("clip"); p.add_argument("--provider", choices=["openrouter", "higgsfield"])
+    p.add_argument("clip"); p.add_argument("--provider", choices=["openrouter", "higgsfield", "localqueue"])
     p.add_argument("--yes", action="store_true"); p.add_argument("--res", choices=["480p", "720p", "1080p"])
     p.add_argument("--no-audio-ref", action="store_true", help="motion only: submit without the song window")
     p.add_argument("--resubmit-unknown", action="store_true",

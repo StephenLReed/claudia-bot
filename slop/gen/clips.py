@@ -85,6 +85,7 @@ from ..config import SlopError, load_project
 from ..sync.songdata import CLEAN_LO, SongData, norm_compact
 from . import higgsfield as hf
 from . import hosting
+from . import localqueue as lq
 from . import models as reg
 from . import store
 from . import templates as tpl
@@ -95,6 +96,7 @@ from .openrouter import OpenRouter, ProviderError, classify, data_url
 SUNG_DUR = (4, 8)
 MOTION_DUR = (4, 12)
 RESOLUTIONS = ("480p", "720p", "1080p")
+PROVIDERS = ("openrouter", "higgsfield", "localqueue")
 TS_RE = re.compile(r"\d+(?:\.\d+)?\s*[–-]\s*\d+(?:\.\d+)?\s*s\b")
 LINE_QUOTE_RE = re.compile(r'\d+(?:\.\d+)?\s*[–-]\s*\d+(?:\.\d+)?\s*s\s*\("([^"]*)"\)')   # a screenplay line's sung words
 FPS = 24
@@ -564,6 +566,8 @@ def new(pdir: Path, shot_id: str, kind: str, *, cid: str | None = None, t0: floa
             warns.append(note)
     else:
         mdl = default_model(project)
+    if prov == lq.PROVIDER and not model:
+        mdl = lq.load_config(pdir)["model"]
     cid = cid or next_id(pdir, kind, shot_id)
     if store.exists(pdir, cid):
         old = store.load(pdir, cid)
@@ -778,9 +782,11 @@ def set_fields(pdir: Path, cid: str, *, prompt: str | None = None, requote: bool
     if model:
         c["model"] = model; changed.append("model")
     if provider:
-        if provider not in ("openrouter", "higgsfield"):
-            raise SlopError("--provider must be openrouter or higgsfield")
+        if provider not in PROVIDERS:
+            raise SlopError("--provider must be openrouter, higgsfield or localqueue")
         c["provider"] = provider; changed.append("provider")
+        if provider == lq.PROVIDER and not model:
+            c["model"] = lq.load_config(pdir)["model"]
         if provider == "higgsfield" and not sung and c.get("frame") != "first" and not frame:
             warns.append(f"on Higgsfield a motion clip can keep the plate's exact composition AND the audio: slop clip set "
                          f"{cid} --frame first (start_image + audio_references)")
@@ -998,6 +1004,8 @@ def lock_warnings(c: dict) -> list[str]:
 # ------------------------------------------------------------------------------------------------ costs
 def clip_cost(c: dict) -> dict:
     b = c.get("body") or {}
+    if c.get("provider") == lq.PROVIDER:
+        return {"usd": 0.0, "local": True}
     if c.get("provider") == "higgsfield":
         cr = hf.credits(int(b.get("duration") or 5), b.get("resolution") or "720p")
         return {"credits": cr, "usd": round(cr * hf.USD_PER_CREDIT, 2)}
@@ -1011,6 +1019,8 @@ def clip_cost(c: dict) -> dict:
 
 def describe_cost(c: dict) -> str:
     k = clip_cost(c)
+    if k.get("local"):
+        return lq.describe(None)
     if "credits" in k:
         return f"~{k['credits']:g} Higgsfield credits (~${k['usd']:.2f} at pack price)"
     return f"~${k['usd']:.2f} on OpenRouter" if k.get("usd") is not None else "price unknown"
@@ -1141,6 +1151,12 @@ def preflight(pdir: Path, c: dict, project: dict, *, resolution: str | None = No
         probs.append("a sung clip is never submitted without its audio window (the lips follow it): drop --no-audio-ref")
     if c.get("provider") == "higgsfield":
         model = hf.MODEL
+    elif c.get("provider") == lq.PROVIDER:
+        try:
+            model = lq.load_config(pdir)["model"]
+        except SlopError as e:
+            model = c.get("model") or ""
+            probs.append(str(e))
     else:
         model = c.get("model") or default_model(project)
         if res == "1080p" and "seedance-2.5" in model:
@@ -1184,6 +1200,17 @@ def dry_run(pdir: Path, c: dict, project: dict, *, resolution: str | None = None
             warnings.append(str(e))
         out = {"dry_run": True, "clip": cid, "provider": "higgsfield", "mode": prm["mode"],
                "would_send": {k: v for k, v in prm.items()}, "expected_credits": cr}
+    elif c.get("provider") == lq.PROVIDER:
+        out = {"dry_run": True, "clip": cid, "provider": lq.PROVIDER, "model": model, "est_usd": 0.0}
+        if not any(p.startswith("localqueue needs a config") or p.startswith("localqueue config") for p in probs):
+            cfg = lq.load_config(pdir)
+            audio = None if no_audio_ref else window_src(pdir, c)
+            if not no_audio_ref and not (audio and audio.is_file()):
+                probs.append(f"{cid} has no window audio file: slop clip set {cid} --recut (or --no-audio-ref)")
+                audio = None
+            b = lq.build(pdir, c, cfg, len(c.get("takes") or []) + 1, audio=audio)
+            lines = lq.dry_text(c, b, cfg)
+            out.update(job=b["job"], submit=b["submit"])
     else:
         send = {**c, "body": {**c["body"], "resolution": res}}
         audio_url = None
@@ -1262,8 +1289,8 @@ def submit(pdir: Path, cid: str, *, provider: str | None = None, yes: bool = Fal
     project = proj(pdir)
     flags = ""
     if provider and provider != c.get("provider"):
-        if provider not in ("openrouter", "higgsfield"):
-            raise SlopError("--provider must be openrouter or higgsfield")
+        if provider not in PROVIDERS:
+            raise SlopError("--provider must be openrouter, higgsfield or localqueue")
         c["provider"] = provider
         flags += f" --provider {provider}"
     if dry:
@@ -1293,6 +1320,8 @@ def submit(pdir: Path, cid: str, *, provider: str | None = None, yes: bool = Fal
         raise SlopError(f"{cid} is not ready:\n  - " + "\n  - ".join(probs))
     if c["provider"] == "higgsfield":
         return _submit_higgsfield(pdir, c, yes=yes, resolution=res)
+    if c["provider"] == lq.PROVIDER:
+        return _submit_localqueue(pdir, c, no_audio_ref=no_audio_ref)
     send = {**c, "body": {**c["body"], "resolution": res}}
     warnings: list[str] = []
     audio_url = None
@@ -1427,6 +1456,55 @@ def _submit_higgsfield(pdir: Path, c: dict, *, yes: bool, resolution: str | None
                     + "".join("\n  ! " + w for w in req.get("warnings", []))}
 
 
+def _submit_localqueue(pdir: Path, c: dict, *, no_audio_ref: bool = False) -> dict:
+    """write the take's job bundle, run the config's submit command, record the ticket. $0 in the ledger."""
+    cid = c["id"]
+    cfg = lq.load_config(pdir)
+    audio = None if no_audio_ref else window_src(pdir, c)
+    if not no_audio_ref and not (audio and audio.is_file()):
+        raise SlopError(f"{cid} has no window audio file: slop clip set {cid} --recut (or --no-audio-ref)")
+    n = len(c.get("takes") or []) + 1
+    b = lq.build(pdir, c, cfg, n, audio=audio)
+    lq.write_bundle(b)
+    r = lq.run(b["submit"], cfg)
+    ticket = lq.ticket_from(r.stdout, cfg)
+    tk = _new_take(c, provider=lq.PROVIDER, id=ticket, status="submitted", model=cfg["model"], est_usd=0.0,
+                   values=b["values"], job=b["job"], ref_audio=store.rel(pdir, audio) if audio else None,
+                   gpu_min_est=cfg.get("gpu_min_per_clip"))
+    c["status"] = "submitted"
+    store.save(pdir, c)
+    ledger.record(pdir, provider=lq.PROVIDER, model=cfg["model"], kind="video", est_usd=0.0, request_id=ticket,
+                  status="submitted", units={"clip": cid, "take": n, "duration": c["body"]["duration"],
+                                             "gpu_min_est": cfg.get("gpu_min_per_clip")},
+                  note=f"{cfg['name']} ticket")
+    return {"clip": cid, "take": n, "ticket": ticket, "work_dir": b["values"]["work_dir"],
+            "text": f"{cid}: take {n} submitted to {cfg['name']} as {ticket} ({lq.describe(cfg)}); "
+                    f"next: slop clip poll {cid}"}
+
+
+def _poll_localqueue(pdir: Path, c: dict, tk: dict) -> tuple[dict, str]:
+    cfg = lq.load_config(pdir)
+    r = lq.collect(pdir, c, tk, cfg)
+    if r["state"] == "pending":
+        return ({"clip": c["id"], "take": tk["n"], "status": "submitted", "job_status": "pending"},
+                f"{c['id']}: take {tk['n']} ({tk['id']}) still in the queue — slop clip poll {c['id']} later")
+    if r["state"] == "failed":
+        tk.update(status="failed", error=r["error"], failed=store.now())
+        c["status"] = "locked"
+        store.save(pdir, c)
+        return ({"clip": c["id"], "take": tk["n"], "status": "failed", "job_status": "failed"},
+                f"{c['id']}: take {tk['n']} ({tk['id']}) failed: {r['error']}")
+    out = r["file"]
+    tk.update(status="delivered", file=store.rel(pdir, out), delivered=store.now(), duration_s=probe_duration(out),
+              sha1=store.file_sha1(out), queue_state=r.get("queue_state"))
+    c["status"] = "delivered"
+    store.save(pdir, c)
+    return ({"clip": c["id"], "take": tk["n"], "status": "delivered", "job_status": r.get("queue_state") or "done",
+             "file": tk["file"]},
+            f"{c['id']}: take {tk['n']} delivered -> {tk['file']} ($0, {cfg['name']}); "
+            + (f"next: slop clip sync {c['id']}" if c["kind"] == "sung" else "motion take: review it"))
+
+
 @project_hints
 def finalize(pdir: Path, cid: str, take_n: int, *, yes: bool = False, dry: bool = False, again: bool = False) -> dict:
     """`slop clip submit CLIP --provider higgsfield --finalize-from TAKE`: the request that finalizes a kept 480p
@@ -1549,6 +1627,11 @@ def poll(pdir: Path, cids: list[str] | None = None, *, wait_s: float = 0.0, job_
         lines.append(f"{cids[0]}: job {job_id} attached to take {attached}")
     client = client or (OpenRouter() if any(_pending_or(c) for c in clips) else None)
     for c in clips:
+        lqk = next((t for t in reversed(c.get("takes") or []) if t.get("provider") == lq.PROVIDER
+                    and t.get("status") == "submitted"), None)
+        if lqk:
+            res, msg = _poll_localqueue(pdir, c, lqk)
+            results.append(res); lines.append(msg); continue
         tk = _pending_or(c)
         if not tk:
             hfk = next((t for t in reversed(c.get("takes") or []) if t.get("provider") == "higgsfield"
